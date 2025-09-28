@@ -1,0 +1,3 @@
+pwsh -NoProfile -ExecutionPolicy Bypass -File "C:\Scripts\Documents-TopFolders-AppOnly-Parallel.ps1" `
+  -OutputCsv "C:\Reports\Documents-TopFolders.csv" `
+  -Throttle 6
