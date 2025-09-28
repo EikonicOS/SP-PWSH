@@ -1,0 +1,170 @@
+<#
+Reports for each FIRST-LEVEL subfolder under every TOP-LEVEL folder in the "Documents" library:
+- FileCount, SubfolderCount, SizeBytes/MB/GB (recursive within each first-level subfolder)
+- Progress bar + ETA per subfolder
+
+Requires: Microsoft.Graph.Authentication
+#>
+
+param(
+  [string]$HostName    = "<tenantname>.sharepoint.com",
+  [string]$SitePath    = "sites/<sitename>",
+  [string]$LibraryName = "<Documents>",
+  [string]$OutputCsv   = "C:\Reports\Documents-OneLevel.csv"
+)
+
+$ErrorActionPreference = 'Stop'
+Import-Module Microsoft.PowerShell.Utility -ErrorAction Stop
+Import-Module Microsoft.PowerShell.Management -ErrorAction Stop
+
+if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Authentication)) {
+  Write-Host "Installing Microsoft.Graph.Authentication..." -ForegroundColor Yellow
+  Install-Module Microsoft.Graph.Authentication -Scope CurrentUser -Force -AllowClobber
+}
+Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
+Connect-MgGraph -Scopes 'Sites.Read.All','Files.Read.All' | Out-Null
+
+function Resolve-SiteId {
+  param([string]$HostName, [string]$SitePath)
+  $cleanSitePath = $SitePath.TrimStart('/')
+  $byPathUri = "/v1.0/sites/${HostName}:/$cleanSitePath"
+  try {
+    $site = Invoke-MgGraphRequest -Method GET -Uri $byPathUri
+    if ($site.id) { return $site.id }
+  } catch {
+    # >>> FIXED LINE (brace the variable) <<<
+    Write-Warning "Direct site path lookup failed (${HostName}:/$cleanSitePath). Falling back to search..."
+  }
+  $name = ($cleanSitePath.Split('/') | Select-Object -Last 1)
+  $search = Invoke-MgGraphRequest -Method GET -Uri "/v1.0/sites?search=$name"
+  $cand = $search.value | Where-Object { $_.webUrl -like "https://$HostName/*" } | Select-Object -First 1
+  if ($cand) { return $cand.id }
+  throw "Could not resolve site id for host '${HostName}' and path '$SitePath'."
+}
+
+function Get-ChildrenPaged {
+  param([string]$DriveId, [string]$ItemId)
+  $uri = "/v1.0/drives/$DriveId/items/$ItemId/children?`$top=999&`$select=id,name,folder,size,parentReference"
+  while ($true) {
+    $resp = Invoke-MgGraphRequest -Method GET -Uri $uri
+    foreach ($c in $resp.value) { $c }
+    $next = $resp.'@odata.nextLink'
+    if (-not $next) { break }
+    $uri = $next
+  }
+}
+
+function Show-Progress {
+  param(
+    [string]$Activity, [int]$Processed, [int]$Discovered,
+    [System.Diagnostics.Stopwatch]$Timer
+  )
+  $total   = [Math]::Max(1, $Discovered)
+  $percent = [Math]::Min(99, [int](($Processed / [double]$total) * 100))
+  $elapsed = $Timer.Elapsed
+  $ips     = if ($elapsed.TotalSeconds -gt 0) { $Processed / $elapsed.TotalSeconds } else { 0 }
+  $remain  = [Math]::Max(0, $Discovered - $Processed)
+  $eta     = if ($ips -gt 0) { [TimeSpan]::FromSeconds($remain / $ips) } else { [TimeSpan]::Zero }
+  $status  = "{0} | {1}/{2} items | {3}/s | Elapsed {4} | ETA {5}" -f `
+             (Get-Date).ToString("HH:mm:ss"),
+             $Processed, $Discovered,
+             ([Math]::Round($ips,2)),
+             $elapsed.ToString("hh\:mm\:ss"),
+             $eta.ToString("hh\:mm\:ss")
+  Write-Progress -Activity $Activity -Status $status -PercentComplete $percent
+}
+
+$siteId = Resolve-SiteId -HostName $HostName -SitePath $SitePath
+$drives = Invoke-MgGraphRequest -Method GET -Uri "/v1.0/sites/$siteId/drives"
+$drive  = $drives.value | Where-Object name -eq $LibraryName | Select-Object -First 1
+if (-not $drive) { $available = ($drives.value.name -join ', '); throw "Library '$LibraryName' not found. Available: $available" }
+$driveId = $drive.id
+
+$topChildren = Invoke-MgGraphRequest -Method GET -Uri "/v1.0/drives/$driveId/root/children?`$top=999&`$select=id,name,folder,size"
+$topFolders  = $topChildren.value | Where-Object { $_.folder -ne $null }
+if (-not $topFolders) {
+  Write-Host "No top-level folders found in '$LibraryName'." -ForegroundColor Yellow
+  "" | Out-File -FilePath $OutputCsv
+  Write-Host "Wrote empty CSV: $OutputCsv"
+  return
+}
+
+$results = @()
+
+foreach ($tf in $topFolders) {
+  $topName = $tf.name
+  $topId   = $tf.id
+
+  $firstLevel = Invoke-MgGraphRequest -Method GET -Uri "/v1.0/drives/$driveId/items/$topId/children?`$top=999&`$select=id,name,folder,size"
+  $firstLevelFolders = $firstLevel.value | Where-Object { $_.folder -ne $null }
+
+  if (-not $firstLevelFolders) {
+    $results += [pscustomobject]@{
+      TopFolder       = $topName; SubFolder = ""; FolderPath = $topName
+      FileCount       = 0; SubfolderCount  = 0
+      SizeBytes       = 0; SizeMB          = 0; SizeGB = 0
+    }
+    continue
+  }
+
+  foreach ($sub in $firstLevelFolders) {
+    $subName = $sub.name
+    $subId   = $sub.id
+    $displayPath = "$topName/$subName"
+
+    $fileCount = 0; $subfolderCount = 0; [int64]$bytes = 0
+
+    $stack = New-Object System.Collections.Stack
+    $stack.Push($sub)
+
+    $processed = 0; $discovered = 1
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $lastUpdate = [datetime]::MinValue
+
+    while ($stack.Count -gt 0) {
+      $current = $stack.Pop()
+      $processed++
+
+      $now = Get-Date
+      if (($now - $lastUpdate).TotalMilliseconds -ge 200) {
+        Show-Progress -Activity "Scanning '$displayPath'..." -Processed $processed -Discovered $discovered -Timer $sw
+        $lastUpdate = $now
+      }
+
+      if ($null -ne $current.folder) {
+        if ($current.id -ne $subId) { $subfolderCount++ }
+        foreach ($child in Get-ChildrenPaged -DriveId $driveId -ItemId $current.id) {
+          $discovered++
+          if ($null -ne $child.folder) {
+            $stack.Push($child)
+          } else {
+            $fileCount++
+            $bytes += [int64]$child.size
+          }
+        }
+      }
+    }
+
+    Write-Progress -Activity "Scanning '$displayPath'..." -Completed
+    $mb = [Math]::Round(($bytes / 1MB), 2)
+
+    Write-Host ("{0} ✓  Files: {1}, Subfolders: {2}, Size: {3} MB" -f $displayPath,$fileCount,$subfolderCount,$mb) -ForegroundColor Gray
+
+    $results += [pscustomobject]@{
+      TopFolder       = $topName
+      SubFolder       = $subName
+      FolderPath      = $displayPath
+      FileCount       = $fileCount
+      SubfolderCount  = $subfolderCount
+      SizeBytes       = $bytes
+      SizeMB          = $mb
+      SizeGB          = [Math]::Round(($bytes / 1GB), 4)
+    }
+  }
+}
+
+$dir = Split-Path -Parent $OutputCsv
+if (-not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory | Out-Null }
+$results | Sort-Object SizeBytes -Descending | Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
+
+Write-Host "Done. Wrote: $OutputCsv" -ForegroundColor Green
