@@ -1,0 +1,17 @@
+$cert = New-SelfSignedCertificate `
+  -Subject "CN=GraphApp-SharePointReport" `
+  -CertStoreLocation "Cert:\CurrentUser\My" `
+  -KeyExportPolicy Exportable -KeySpec Signature `
+  -KeyLength 2048 -KeyAlgorithm RSA `
+  -HashAlgorithm SHA256 `
+  -NotAfter (Get-Date).AddYears(2)
+
+# Export public cert (.cer) to upload in Entra
+Export-Certificate -Cert $cert -FilePath "$env:USERPROFILE\Desktop\GraphApp-SharePointReport.cer"
+
+# (Optional) Export private key backup (.pfx)
+$pwd = Read-Host -AsSecureString "Choose a PFX password"
+Export-PfxCertificate -Cert $cert -FilePath "$env:USERPROFILE\Desktop\GraphApp-SharePointReport.pfx" -Password $pwd
+
+# Keep the thumbprint handy
+$thumb = $cert.Thumbprint; $thumb
