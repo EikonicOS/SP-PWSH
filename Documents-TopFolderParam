@@ -3,41 +3,43 @@ Reports size and counts for TOP-LEVEL folders in the "Documents" library:
 - SizeBytes: total of all files under that folder (recursive)
 - FileCount: total files (recursive)
 - SubfolderCount: total subfolders (recursive; excludes the folder itself)
-- Shows Write-Progress with estimated % and ETA
+- Shows Write-Progress (per folder) + macro counter [i/N]
 
 Use -TopFolderName "Folder 1" to process only that top-level folder.
-Requires: Microsoft.Graph.Authentication (lightweight)
-Install once (PowerShell 7+):
-  Install-Module Microsoft.Graph.Authentication -Scope CurrentUser
+
+Requires:
+  - PowerShell 7+ (pwsh)
+  - Microsoft.Graph.Authentication
+    Install-Module Microsoft.Graph.Authentication -Scope CurrentUser
 #>
 
 param(
-  [string]$HostName    = "<tenent>.sharepoint.com",      # tenant host
-  [string]$SitePath    = "sites/<SiteName>",                   # site path
-  [string]$LibraryName = "Documents",                     # library name
+  [string]$HostName    = "hashiragg.sharepoint.com",
+  [string]$SitePath    = "sites/House",
+  [string]$LibraryName = "Documents",
   [string]$OutputCsv   = "C:\Reports\Documents-TopFolders.csv",
-  [string]$TopFolderName                                  # optional: only this top-level folder
+  [string]$TopFolderName
 )
 
 $ErrorActionPreference = 'Stop'
 
-# Core modules (Get-Variable, Join-Path, Split-Path, etc.)
+# Core modules
 Import-Module Microsoft.PowerShell.Utility -ErrorAction Stop
 Import-Module Microsoft.PowerShell.Management -ErrorAction Stop
 
-# Lightweight Graph auth module only
+# Lightweight Graph auth only
 if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Authentication)) {
   Write-Host "Installing Microsoft.Graph.Authentication..." -ForegroundColor Yellow
   Install-Module Microsoft.Graph.Authentication -Scope CurrentUser -Force -AllowClobber
 }
 Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
 
-# Connect (interactive consent if needed)
-Connect-MgGraph -Scopes 'Sites.Read.All','Files.Read.All' | Out-Null
+# Connect (interactive if needed)
+if (-not (Get-MgContext)) {
+  Connect-MgGraph -Scopes 'Sites.Read.All','Files.Read.All' | Out-Null
+}
 
 # ---------- Helpers ----------
-
-# Resolve the site id (by path, fallback to search)
 function Resolve-SiteId {
   param([string]$HostName, [string]$SitePath)
   $cleanSitePath = $SitePath.TrimStart('/')
@@ -55,7 +57,6 @@ function Resolve-SiteId {
   throw "Could not resolve site id for host '${HostName}' and path '$SitePath'."
 }
 
-# Page through children (files + folders)
 function Get-ChildrenPaged {
   param([string]$DriveId, [string]$ItemId)
   $uri = "/v1.0/drives/$DriveId/items/$ItemId/children?`$top=999&`$select=id,name,folder,parentReference,size"
@@ -64,11 +65,10 @@ function Get-ChildrenPaged {
     foreach ($c in $resp.value) { $c }
     $next = $resp.'@odata.nextLink'
     if (-not $next) { break }
-    $uri = $next   # nextLink can be a full URL
+    $uri = $next
   }
 }
 
-# Progress/ETA helper
 function Show-Progress {
   param(
     [string]$Activity,
@@ -92,17 +92,13 @@ function Show-Progress {
 }
 
 # ---------- Resolve site + library ----------
-
 $siteId = Resolve-SiteId -HostName $HostName -SitePath $SitePath
 $drives = Invoke-MgGraphRequest -Method GET -Uri "/v1.0/sites/$siteId/drives"
 $drive  = $drives.value | Where-Object name -eq $LibraryName | Select-Object -First 1
-if (-not $drive) {
-  $available = ($drives.value.name -join ', ')
-  throw "Library '$LibraryName' not found. Available: $available"
-}
+if (-not $drive) { $available = ($drives.value.name -join ', '); throw "Library '$LibraryName' not found. Available: $available" }
 $driveId = $drive.id
 
-# Get top-level children; pick only folders
+# Top-level folders
 $topChildren = Invoke-MgGraphRequest -Method GET -Uri "/v1.0/drives/$driveId/root/children?`$top=999&`$select=id,name,folder,size"
 $topFolders  = $topChildren.value | Where-Object { $_.folder -ne $null }
 
@@ -113,27 +109,30 @@ if (-not $topFolders) {
   return
 }
 
-# Filter to just the requested top-level folder (if provided)
+# Filter to a single named top folder if requested
 if ($TopFolderName) {
-  # case-insensitive exact name match first; if none, try wildcard -like
   $one = $topFolders | Where-Object { $_.name -ieq $TopFolderName } | Select-Object -First 1
-  if (-not $one) {
-    $one = $topFolders | Where-Object { $_.name -like $TopFolderName } | Select-Object -First 1
-  }
+  if (-not $one) { $one = $topFolders | Where-Object { $_.name -like $TopFolderName } | Select-Object -First 1 }
   if (-not $one) {
     $available = ($topFolders.name -join ', ')
     throw "Top-level folder '$TopFolderName' not found. Available: $available"
   }
-  $topFolders = @($one)  # only the selected one
+  $topFolders = @($one)
 }
 
-# ---------- Scan and export ----------
+# Macro counter
+$totalFolders = $topFolders.Count
+$folderIndex  = 0
 
+# ---------- Scan ----------
 $results = @()
 
 foreach ($tf in $topFolders) {
+  $folderIndex++
   $folderName = $tf.name
   $folderId   = $tf.id
+
+  Write-Host ("[{0}/{1}] Scanning top-level folder: {2}" -f $folderIndex, $totalFolders, $folderName) -ForegroundColor Cyan
 
   $fileCount = 0
   $subfolderCount = 0
@@ -187,6 +186,7 @@ foreach ($tf in $topFolders) {
   }
 }
 
+# Export
 $dir = Split-Path -Parent $OutputCsv
 if (-not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory | Out-Null }
 $results | Sort-Object SizeBytes -Descending | Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
