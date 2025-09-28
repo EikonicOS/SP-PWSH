@@ -1,0 +1,158 @@
+# C:\Scripts\Documents-TopFolders-AppOnly-Parallel.ps1
+param(
+  [string]$HostName    = "hashiragg.sharepoint.com",
+  [string]$SitePath    = "sites/House",
+  [string]$LibraryName = "Documents",
+  [string]$OutputCsv   = "C:\Reports\Documents-TopFolders.csv",
+  [int]   $Throttle    = 6
+)
+
+$ErrorActionPreference = 'Stop'
+
+# --- Require PowerShell 7+ ---
+if (-not $PSVersionTable -or $PSVersionTable.PSEdition -ne 'Core' -or $PSVersionTable.PSVersion.Major -lt 7) {
+  throw "This script requires PowerShell 7+ (pwsh). Current: $($PSVersionTable.PSEdition) $($PSVersionTable.PSVersion)"
+}
+
+# --- App-only Graph auth (FILL THESE IN) ---
+$TenantId = "<TENANT-ID>"
+$ClientId = "<APP-CLIENT-ID>"
+$Thumb    = "<CERT-THUMBPRINT>"
+
+# Paths
+$dir = Split-Path -Parent $OutputCsv
+if (-not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory | Out-Null }
+$ErrorLog = Join-Path $dir "Documents-TopFolders.errors.log"
+
+# Core + Graph auth module for the main session
+Import-Module Microsoft.PowerShell.Utility -ErrorAction Stop
+Import-Module Microsoft.PowerShell.Management -ErrorAction Stop
+Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
+
+# Connect once in the main session (not reused by runspaces, but good sanity check)
+if (-not (Get-MgContext)) {
+  Connect-MgGraph -TenantId $TenantId -ClientId $ClientId -CertificateThumbprint $Thumb -NoWelcome | Out-Null
+}
+
+# --- Helpers (main session) ---
+function Resolve-SiteId {
+  param([string]$HostName, [string]$SitePath)
+  $cleanSitePath = $SitePath.TrimStart('/')
+  $byPathUri = "/v1.0/sites/${HostName}:/$cleanSitePath"
+  try {
+    $site = Invoke-MgGraphRequest -Method GET -Uri $byPathUri
+    if ($site.id) { return $site.id }
+  } catch {
+    Write-Warning "Direct site path lookup failed (${HostName}:/$cleanSitePath). Falling back to search..."
+  }
+  $name = ($cleanSitePath.Split('/') | Select-Object -Last 1)
+  $search = Invoke-MgGraphRequest -Method GET -Uri "/v1.0/sites?search=$name"
+  $cand = $search.value | Where-Object { $_.webUrl -like "https://$HostName/*" } | Select-Object -First 1
+  if ($cand) { return $cand.id }
+  throw "Could not resolve site id for host '${HostName}' and path '$SitePath'."
+}
+
+# --- Resolve drive and top-level folders in the main session ---
+$siteId = Resolve-SiteId -HostName $HostName -SitePath $SitePath
+
+$drives = Invoke-MgGraphRequest -Method GET -Uri "/v1.0/sites/$siteId/drives"
+$drive  = $drives.value | Where-Object name -eq $LibraryName | Select-Object -First 1
+if (-not $drive) {
+  $available = ($drives.value.name -join ', ')
+  throw "Library '$LibraryName' not found. Available: $available"
+}
+$driveId = $drive.id
+
+# Page top-level children to get ALL folders (>999 supported)
+$topFolders = @()
+$uri = "/v1.0/drives/$driveId/root/children?`$select=id,name,folder&`$top=999"
+while ($true) {
+  $resp = Invoke-MgGraphRequest -Method GET -Uri $uri
+  $topFolders += ($resp.value | Where-Object { $_.folder -ne $null })
+  $next = $resp.'@odata.nextLink'
+  if (-not $next) { break }
+  $uri = $next
+}
+
+if (-not $topFolders) {
+  New-Item -ItemType File -Force -Path $OutputCsv | Out-Null
+  '"TopFolder","FolderPath","FileCount","SubfolderCount","SizeBytes","SizeMB","SizeGB"' | Out-File $OutputCsv -Encoding UTF8
+  Write-Host "No top-level folders found; wrote empty CSV: $OutputCsv"
+  exit
+}
+
+# Prepare CSV & log
+$null = New-Item -ItemType File -Path $OutputCsv -Force
+'"TopFolder","FolderPath","FileCount","SubfolderCount","SizeBytes","SizeMB","SizeGB"' | Out-File $OutputCsv -Encoding UTF8
+$null = New-Item -ItemType File -Path $ErrorLog -Force
+"[Start $(Get-Date -Format s)] Errors will appear here." | Out-File $ErrorLog
+
+Write-Host ("Found {0} top-level folder(s). Starting parallel scan..." -f $topFolders.Count) -ForegroundColor Cyan
+
+# --- PARALLEL SCAN ---
+$topFolders | ForEach-Object -Parallel {
+  # Bring in outer-scope values
+  $TenantId  = $using:TenantId
+  $ClientId  = $using:ClientId
+  $Thumb     = $using:Thumb
+  $DriveId   = $using:driveId
+  $OutputCsv = $using:OutputCsv
+  $ErrorLog  = $using:ErrorLog
+
+  # Each runspace must import and connect on its own
+  $ErrorActionPreference = 'Stop'
+  try {
+    Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
+    if (-not (Get-MgContext)) {
+      Connect-MgGraph -TenantId $TenantId -ClientId $ClientId -CertificateThumbprint $Thumb -NoWelcome | Out-Null
+    }
+
+    function Get-ChildrenPaged {
+      param([string]$DriveId, [string]$ItemId)
+      $uri = "/v1.0/drives/$DriveId/items/$ItemId/children?`$top=999&`$select=id,name,folder,parentReference,size"
+      while ($true) {
+        $resp = Invoke-MgGraphRequest -Method GET -Uri $uri
+        foreach ($c in $resp.value) { $c }
+        $next = $resp.'@odata.nextLink'
+        if (-not $next) { break }
+        $uri = $next
+      }
+    }
+
+    $folderName = $PSItem.name
+    $folderId   = $PSItem.id
+
+    # Walk this folder
+    $fileCount = 0; $subfolderCount = 0; [int64]$bytes = 0
+    $stack = [System.Collections.Stack]::new()
+    $stack.Push($PSItem)
+
+    while ($stack.Count -gt 0) {
+      $current = $stack.Pop()
+      if ($null -ne $current.folder) {
+        if ($current.id -ne $folderId) { $subfolderCount++ }
+        foreach ($child in Get-ChildrenPaged -DriveId $DriveId -ItemId $current.id) {
+          if ($null -ne $child.folder) { $stack.Push($child) }
+          else { $fileCount++; $bytes += [int64]$child.size }
+        }
+      }
+    }
+
+    $mb = [Math]::Round(($bytes / 1MB), 2)
+    $gb = [Math]::Round(($bytes / 1GB), 4)
+    $csvLine =
+      '"' + ($folderName -replace '"','""') + '","' +
+            ($folderName -replace '"','""') + '",' +
+            $fileCount + ',' + $subfolderCount + ',' + $bytes + ',' + $mb + ',' + $gb
+
+    Add-Content -Path $OutputCsv -Value $csvLine -Encoding UTF8
+    Write-Host ("[done] {0} — Files:{1} Folders:{2} SizeMB:{3}" -f $folderName,$fileCount,$subfolderCount,$mb) -ForegroundColor Gray
+  }
+  catch {
+    $msg = "[{0}] Folder '{1}' error: {2}" -f (Get-Date -Format s), $PSItem.name, $_.Exception.Message
+    Add-Content -Path $ErrorLog -Value $msg
+  }
+} -ThrottleLimit $Throttle
+
+Write-Host "Done. CSV: $OutputCsv" -ForegroundColor Green
+Write-Host "If any errors occurred, see: $ErrorLog" -ForegroundColor Yellow
