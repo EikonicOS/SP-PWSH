@@ -1,117 +1,231 @@
-Write-Host "Connecting to Microsoft Graph..." -ForegroundColor Cyan
-Connect-MgGraph -TenantId $TenantId -ClientId $ClientId -CertificateThumbprint $Thumb
-Write-Host "Connected." -ForegroundColor Green
+<# 
+Connect-MgGraph (App-only, Certificate Auth)
+- Uses your App (Client) ID, Tenant ID, and certificate thumbprint.
+- Searches both CurrentUser\My and LocalMachine\My for the certificate.
+- Verifies connection and prints context.
+- Optionally runs a simple test query if permissions allow.
+
+Requirements:
+- Microsoft.Graph modules installed (Authentication at minimum).
+- The app has Application permissions with admin consent granted.
+
+Author: You + ChatGPT
+#>
+
+# -------------------- CONFIG --------------------
+$AppId       = "4a36cf8c-5c1a-4dcb-aa5d-8456fd3e8876"
+$TenantId    = "808f60fb-b19e-4f68-9498-d5241f7abe49"
+$Thumbprint  = "D13A5DA55BE7BB6D7D724458FE37A8A05DBA9E28"
+$UseBeta     = $false   # set $true to use the beta profile
+$StartDateTime = (Get-Date).AddDays(-7).ToString("yyyy-MM-ddTHH:mm:ssZ")  # ISO 8601 format
+$EndDateTime   = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssZ")              # ISO 8601 format
+# ------------------------------------------------
 
 # ============================================
-# Check required permissions
+# Microsoft Graph Module Management
 # ============================================
-$requiredPermissions = @(
-    "User.Read.All",
-    "Calendars.Read"
+Write-Host "Checking Microsoft Graph module installation..." -ForegroundColor Cyan
+
+# Force cleanup of any existing Graph modules in session
+Get-Module Microsoft.Graph* | Remove-Module -Force -ErrorAction SilentlyContinue
+
+# Check if Microsoft.Graph module is already installed
+$graphModule = Get-Module -ListAvailable -Name Microsoft.Graph
+if ($graphModule) {
+    Write-Host "✔ Microsoft.Graph module is already installed (Version: $($graphModule[0].Version))" -ForegroundColor Green
+} else {
+    # Install fresh copy of Microsoft.Graph
+    try {
+        Write-Host "Installing Microsoft.Graph module..." -ForegroundColor Yellow
+        Install-Module Microsoft.Graph -Scope CurrentUser -Force -AllowClobber -Repository PSGallery -SkipPublisherCheck
+        Write-Host "✔ Microsoft.Graph module installed successfully" -ForegroundColor Green
+    } catch {
+        Write-Error "Failed to install Microsoft.Graph module: $($_.Exception.Message)"
+        throw
+    }
+}
+
+# Wait a moment for installation to complete
+Start-Sleep -Seconds 3
+
+# Import modules with enhanced retry logic
+$requiredModules = @(
+    'Microsoft.Graph.Authentication',
+    'Microsoft.Graph.Calendar', 
+    'Microsoft.Graph.Users',
+    'Microsoft.Graph.Applications',
+    'Microsoft.Graph.Mail'
 )
 
-Write-Host "Checking Graph permissions for this app..." -ForegroundColor Cyan
-
-try {
-    $sp = Get-MgServicePrincipal -Filter "appId eq '$ClientId'" -ErrorAction Stop
+foreach ($module in $requiredModules) {
+    $retryCount = 0
+    $maxRetries = 5
+    $imported = $false
     
-    $assignedPerms = @()
-    if ($sp.AppRoles) {
-        $sp.AppRoles | ForEach-Object {
-            if ($_.Value) { $assignedPerms += $_.Value }
+    Write-Host "Importing $module..." -ForegroundColor Cyan
+    
+    while (-not $imported -and $retryCount -lt $maxRetries) {
+        try {
+            # Force remove if already loaded
+            Remove-Module $module -Force -ErrorAction SilentlyContinue
+            
+            # Import with specific parameters
+            Import-Module $module -Force -Global -PassThru -ErrorAction Stop | Out-Null
+            
+            # Verify the module is actually loaded
+            $loadedModule = Get-Module $module
+            if ($loadedModule) {
+                Write-Host "✔ $module imported successfully (Version: $($loadedModule.Version))" -ForegroundColor Green
+                $imported = $true
+            } else {
+                throw "Module $module was not loaded after import"
+            }
+        } catch {
+            $retryCount++
+            Write-Warning "Attempt $retryCount failed to import $module. Error: $($_.Exception.Message)"
+            
+            if ($retryCount -lt $maxRetries) {
+                Write-Host "Retrying in 3 seconds..." -ForegroundColor Yellow
+                Start-Sleep -Seconds 3
+            } else {
+                Write-Error "Failed to import $module after $maxRetries attempts."
+                Write-Host "Available modules:" -ForegroundColor Yellow
+                Get-Module -ListAvailable Microsoft.Graph* | Select-Object Name, Version | Format-Table
+                throw "Critical module import failure: $module"
+            }
         }
     }
+}
 
-    $missingPerms = $requiredPermissions | Where-Object { $_ -notin $assignedPerms }
+# Verify core cmdlets are available with detailed checking
+$coreCmdlets = @('Connect-MgGraph', 'Get-MgUser', 'Get-MgServicePrincipal', 'Get-MgUserCalendar', 'Get-MgUserCalendarEvent')
+$missingCmdlets = @()
 
-    if ($missingPerms.Count -gt 0) {
-        Write-Host "======================================" -ForegroundColor Red
-        Write-Host "ERROR: Missing required permissions!" -ForegroundColor Red
-        Write-Host "This app does not have the following permissions:" -ForegroundColor Yellow
-        $missingPerms | ForEach-Object { Write-Host "  - $_" -ForegroundColor Yellow }
-        Write-Host ""
-        Write-Host "You must add these in Entra ID (Azure AD) > App Registrations > API Permissions," -ForegroundColor Gray
-        Write-Host "then grant admin consent, before this script will work." -ForegroundColor Gray
-        Write-Host "======================================" -ForegroundColor Red
-        throw "Missing permissions: $($missingPerms -join ', ')"
+foreach ($cmdlet in $coreCmdlets) {
+    if (-not (Get-Command $cmdlet -ErrorAction SilentlyContinue)) {
+        $missingCmdlets += $cmdlet
     }
-    else {
-        Write-Host "All required permissions are present." -ForegroundColor Green
-    }
+}
+
+if ($missingCmdlets.Count -gt 0) {
+    Write-Error "Critical cmdlets are not available: $($missingCmdlets -join ', ')"
+    Write-Host "Loaded modules:" -ForegroundColor Yellow
+    Get-Module Microsoft.Graph* | Select-Object Name, Version | Format-Table
+    throw "Required cmdlets missing"
+}
+
+Write-Host "✔ All required modules imported and verified" -ForegroundColor Green
+
+# Find the certificate by thumbprint in CurrentUser and LocalMachine stores
+Write-Host "Locating certificate with thumbprint: $Thumbprint ..." -ForegroundColor Cyan
+
+$stores = @(
+    "Cert:\CurrentUser\My",
+    "Cert:\LocalMachine\My"
+)
+
+$cert = $null
+foreach ($store in $stores) {
+    $c = Get-ChildItem -Path $store | Where-Object { $_.Thumbprint -eq $Thumbprint }
+    if ($c) { $cert = $c; break }
+}
+
+if (-not $cert) {
+    Write-Error "Certificate not found in CurrentUser\My or LocalMachine\My. Ensure it's installed and the thumbprint is correct."
+    throw
+}
+
+Write-Host "✔ Certificate found in $($cert.PSParentPath)" -ForegroundColor Green
+Write-Host "   Subject: $($cert.Subject)"
+Write-Host "   NotBefore: $($cert.NotBefore) | NotAfter: $($cert.NotAfter)"
+Write-Host ""
+
+# Connect with app-only certificate auth
+try {
+    Write-Host "Connecting to Microsoft Graph (app-only)..." -ForegroundColor Cyan
+    Connect-MgGraph -ClientId $AppId -TenantId $TenantId -CertificateThumbprint $Thumbprint -NoWelcome
+
+    $ctx = Get-MgContext
+    Write-Host "✔ Connected." -ForegroundColor Green
+    Write-Host ("Account:   {0}" -f $ctx.Account)
+    Write-Host ("TenantId:  {0}" -f $ctx.TenantId)
+    Write-Host ("ClientId:  {0}" -f $ctx.ClientId)
+    Write-Host ("Scopes:    {0}" -f (($ctx.Scopes -join ", ")))
+    Write-Host ("TokenType: {0}" -f $ctx.AuthType)   # Expect 'AppOnly' for cert-based app auth
+    Write-Host ("Profile:   {0}" -f $ctx.GraphEndpoint) 
 }
 catch {
-    Write-Host "FATAL: Could not check permissions. $_" -ForegroundColor Red
-    #exit
+    Write-Error "Failed to connect: $($_.Exception.Message)"
+    throw
 }
 
-# ============================================
-# Path to CSV file containing user IDs
-# ============================================
-$userCsvPath = "E:\gflores\CreditUserIDs.csv"
-
-if (!(Test-Path $userCsvPath)) {
-    Write-Error "User CSV file not found at: $userCsvPath"
-    Write-Host "Please create a CSV file with a 'UserID' column containing email addresses."
-    exit
+# ---- Optional sanity test (will only work if the app has the right Application permissions + admin consent) ----
+try {
+    Write-Host "`nAttempting a simple test call (Get-MgOrganization)..." -ForegroundColor Yellow
+    $org = Get-MgOrganization -ErrorAction Stop
+    if ($org) {
+        Write-Host ("✔ Org display name: {0}" -f $org.DisplayName) -ForegroundColor Green
+    }
+} catch {
+    Write-Warning "Test call failed (likely missing permissions or consent). This is expected if Application perms weren't granted. Details: $($_.Exception.Message)"
 }
-
-$users = Import-Csv -Path $userCsvPath
 
 # ============================================
 # Date range (ISO 8601 UTC format)
 # ============================================
 $StartDate = (Get-Date).Date.AddDays(-7)
-$EndDate   = (Get-Date).Date.AddDays(1).AddSeconds(-1)
+$EndDate   = (Get-Date).Date.AddDays(1).AddSeconds(-1)  # End of current day (23:59:59)
 
 $StartDateString = $StartDate.ToString("yyyy-MM-ddTHH:mm:ssZ")
 $EndDateString   = $EndDate.ToString("yyyy-MM-ddTHH:mm:ssZ")
 
 # ============================================
-# Initialize
+# Get Public Equity users and process calendar events
 # ============================================
 $allEvents = @()
 $errorLog = @()
 
-$userCount = 0
-$totalUsers = $users.Count
+try {
+    Write-Host "`nSearching for users in the 'Public Equity' department..." -ForegroundColor Yellow
+    $users = Get-MgUser -Filter "startswith(department, 'Public Equity')" -Property Id,DisplayName,Mail,Department,UserPrincipalName,AccountEnabled,OnPremisesSyncEnabled,DeletedDateTime,UserType -ErrorAction Stop
 
-foreach ($user in $users) {
-    $userCount++
-    $userId = $user.UserID
-    Write-Host "[$userCount/$totalUsers] Processing user: $userId" -ForegroundColor Yellow
-    
-    Start-Sleep -Seconds 1
-    
-    $userStatus = [PSCustomObject]@{
-        UserID            = $userId
-        UserFound         = $false
-        UserDisplayName   = ""
-        UserError         = ""
-        AccountStatus     = ""
-        AccountType       = ""
-        CalendarFound     = $false
-        CalendarID        = ""
-        AvailableCalendars= ""
-        CalendarError     = ""
-        EventsFound       = 0
-        EventsError       = ""
-        OverallStatus     = "Processing"
-        ProcessedDateTime = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-    }
-    
-    try {
-        # --- Get user info ---
-        try {
-            $userCheck = Get-MgUser -UserId $userId -Property Id,DisplayName,UserPrincipalName,AccountEnabled,OnPremisesSyncEnabled,DeletedDateTime,UserType,CreationType -ErrorAction Stop
-            Write-Host "  User found: $($userCheck.DisplayName)" -ForegroundColor Green
-            $userStatus.UserFound = $true
-            $userStatus.UserDisplayName = $userCheck.DisplayName
+    if ($users) {
+        Write-Host "✔ Users found: $($users.Count)" -ForegroundColor Green
+        
+        $userCount = 0
+        $totalUsers = $users.Count
+
+        foreach ($user in $users) {
+            $userCount++
+            $userId = $user.Id
+            Write-Host "[$userCount/$totalUsers] Processing user: $($user.DisplayName) ($($user.Mail))" -ForegroundColor Yellow
             
-            if ($userCheck.DeletedDateTime) {
+            Start-Sleep -Seconds 1
+            
+            $userStatus = [PSCustomObject]@{
+                UserID            = $user.Mail
+                UserFound         = $true
+                UserDisplayName   = $user.DisplayName
+                UserError         = ""
+                AccountStatus     = ""
+                AccountType       = ""
+                Department        = $user.Department
+                CalendarFound     = $false
+                CalendarID        = ""
+                AvailableCalendars= ""
+                CalendarError     = ""
+                EventsFound       = 0
+                EventsError       = ""
+                OverallStatus     = "Processing"
+                ProcessedDateTime = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+            }
+            
+            # Set account status
+            if ($user.DeletedDateTime) {
                 $userStatus.AccountStatus = "Soft-Deleted"
-            } elseif (-not $userCheck.AccountEnabled) {
+            } elseif (-not $user.AccountEnabled) {
                 $userStatus.AccountStatus = "Disabled/Inactive"
-            } elseif ($userCheck.OnPremisesSyncEnabled -eq $true) {
+            } elseif ($user.OnPremisesSyncEnabled -eq $true) {
                 $userStatus.AccountStatus = "Active"
                 $userStatus.AccountType = "On-Premises Synced"
             } else {
@@ -119,111 +233,291 @@ foreach ($user in $users) {
                 $userStatus.AccountType = "Cloud-Only"
             }
             
-            if ($userCheck.UserType) {
-                $userStatus.AccountType += " ($($userCheck.UserType))"
+            if ($user.UserType) {
+                $userStatus.AccountType += " ($($user.UserType))"
             }
-        }
-        catch {
-            Write-Host "  ERROR: User not found or inaccessible: $($_.Exception.Message)" -ForegroundColor Red
-            $userStatus.UserError = $_.Exception.Message
-            $userStatus.OverallStatus = "Failed - User Lookup Error"
-            $errorLog += $userStatus
-            continue
-        }
-        
-        # --- Get calendars ---
-        try {
-            $allCalendars = Get-MgUserCalendar -UserId $userId -ErrorAction Stop
-            
-            $calendar = $allCalendars | Where-Object { $_.Name -in @("Calendar", "予定表", "日历") } | Select-Object -First 1
-            
-            if ($calendar) {
-                $userStatus.CalendarFound = $true
-                $userStatus.CalendarID = $calendar.Id
-                Write-Host "  Calendar found: $($calendar.Name)" -ForegroundColor Green
+
+            try {
+                # --- Get calendars ---
+                $allCalendars = Get-MgUserCalendar -UserId $userId -ErrorAction Stop
                 
-                try {
-                    $events = Get-MgUserCalendarEvent -UserId $userId -CalendarId $calendar.Id `
-                        -Filter "start/dateTime ge '$StartDateString' and end/dateTime le '$EndDateString'" `
-                        -Property subject,locations,attendees,start,end,organizer,hasAttachments,attachments `
-                        -Top 999 -ErrorAction Stop
+                $calendar = $allCalendars | Where-Object { $_.Name -in @("Calendar", "予定表", "日历") } | Select-Object -First 1
+                
+                if ($calendar) {
+                    $userStatus.CalendarFound = $true
+                    $userStatus.CalendarID = $calendar.Id
+                    $userStatus.AvailableCalendars = ($allCalendars.Name -join "; ")
+                    Write-Host "  Calendar found: $($calendar.Name)" -ForegroundColor Green
                     
-                    if ($events) {
-                        $userStatus.EventsFound = $events.Count
+                    try {
+                        # Get all events from the calendar including recurring event properties
+                        $events = Get-MgUserCalendarEvent -UserId $userId -CalendarId $calendar.Id `
+                            -Property subject,locations,attendees,start,end,organizer,hasAttachments,attachments,recurrence,type,seriesMasterId `
+                            -Top 500 -ErrorAction Stop
+                        
+                        Write-Host "  Retrieved $($events.Count) total events from calendar" -ForegroundColor Gray
+                        
+                        # Use calendar view to get all event instances (including recurring) within our date range
+                        Write-Host "  Getting calendar view for date range to capture all recurring instances..." -ForegroundColor Gray
+                        try {
+                            $calendarView = Get-MgUserCalendarView -UserId $userId -CalendarId $calendar.Id `
+                                -StartDateTime $StartDateString -EndDateTime $EndDateString `
+                                -Property subject,locations,attendees,start,end,organizer,hasAttachments,seriesMasterId,type,recurrence `
+                                -Top 500 -ErrorAction Stop
+                            
+                            Write-Host "  Calendar view returned $($calendarView.Count) event instances" -ForegroundColor Gray
+                            $allEventInstances = $calendarView
+                        } catch {
+                            Write-Warning "  Failed to get calendar view, falling back to basic events: $($_.Exception.Message)"
+                            $allEventInstances = $events
+                        }
+                        
+                        # Create a lookup table for recurring event master patterns
+                        $masterPatterns = @{}
                         foreach ($event in $events) {
-                            $locationName = if ($event.Locations -and $event.Locations.Count -gt 0) { $event.Locations[0].DisplayName } else { "" }
-                            
-                            $requiredAttendees = @()
-                            $optionalAttendees = @()
-                            $allAttendeesList = @()
-                            
-                            if ($event.Attendees) {
-                                foreach ($attendee in $event.Attendees) {
-                                    $attendeeName = $attendee.EmailAddress.Name
-                                    $allAttendeesList += $attendeeName
-                                    
-                                    switch ($attendee.Type) {
-                                        "required" { $requiredAttendees += $attendeeName }
-                                        "optional" { $optionalAttendees += $attendeeName }
-                                        default { $requiredAttendees += $attendeeName }
-                                    }
-                                }
-                            }
-                            
-                            $organizerName = if ($event.Organizer) { $event.Organizer.EmailAddress.Name } else { "" }
-                            
-                            $allEvents += [PSCustomObject]@{
-                                UserID            = $userId
-                                Subject           = $event.Subject
-                                StartDate         = $event.Start.DateTime
-                                EndDate           = $event.End.DateTime
-                                Location          = $locationName
-                                Organizer         = $organizerName
-                                AllAttendees      = ($allAttendeesList -join "; ")
-                                RequiredAttendees = ($requiredAttendees -join "; ")
-                                OptionalAttendees = ($optionalAttendees -join "; ")
-                                HasAttachments    = if ($event.HasAttachments) { "Yes" } else { "No" }
+                            if ($event.Type -eq "seriesMaster" -and $event.Recurrence -and $event.Recurrence.Pattern) {
+                                $masterPatterns[$event.Id] = $event.Recurrence
                             }
                         }
+                        
+                        Write-Host "  Found $($masterPatterns.Count) recurring event master patterns" -ForegroundColor Gray
+                        Write-Host "  Total event instances to process: $($allEventInstances.Count)" -ForegroundColor Gray
+                        
+                        # Filter all instances by date range in PowerShell (additional safety check)
+                        Write-Host "  Filtering events for date range: $($StartDate.ToString('yyyy-MM-dd')) to $($EndDate.ToString('yyyy-MM-dd'))" -ForegroundColor Gray
+                        
+                        $filteredEvents = @()
+                        foreach ($event in $allEventInstances) {
+                            try {
+                                $eventStart = [DateTime]::Parse($event.Start.DateTime)
+                                $eventEnd = [DateTime]::Parse($event.End.DateTime)
+                                
+                                # Event overlaps with our date range if:
+                                # Event starts before or on our end date AND event ends after or on our start date
+                                if (($eventStart -le $EndDate.AddDays(1)) -and ($eventEnd -ge $StartDate)) {
+                                    $filteredEvents += $event
+                                }
+                            } catch {
+                                Write-Warning "Could not parse dates for event: $($event.Subject) - Including it anyway"
+                                $filteredEvents += $event
+                            }
+                        }
+                        
+                        Write-Host "  Filtered to $($filteredEvents.Count) events in date range" -ForegroundColor Gray
+                        
+                        # Process filtered events
+                        if ($filteredEvents.Count -gt 0) {
+                            $userStatus.EventsFound = $filteredEvents.Count
+                            Write-Host "  Processing $($filteredEvents.Count) events in date range" -ForegroundColor Green
+                            
+                            foreach ($event in $filteredEvents) {
+                                $locationName = if ($event.Locations -and $event.Locations.Count -gt 0) { $event.Locations[0].DisplayName } else { "" }
+                                
+                                $requiredAttendees = @()
+                                $optionalAttendees = @()
+                                $allAttendeesList = @()
+                                
+                                if ($event.Attendees) {
+                                    foreach ($attendee in $event.Attendees) {
+                                        $attendeeName = if ($attendee.EmailAddress.Name) { $attendee.EmailAddress.Name } else { $attendee.EmailAddress.Address }
+                                        $allAttendeesList += $attendeeName
+                                        
+                                        switch ($attendee.Type) {
+                                            "required" { $requiredAttendees += $attendeeName }
+                                            "optional" { $optionalAttendees += $attendeeName }
+                                            default { $requiredAttendees += $attendeeName }
+                                        }
+                                    }
+                                }
+                                
+                                $organizerName = if ($event.Organizer -and $event.Organizer.EmailAddress) { 
+                                    if ($event.Organizer.EmailAddress.Name) { $event.Organizer.EmailAddress.Name } else { $event.Organizer.EmailAddress.Address }
+                                } else { "" }
+                                
+                                # Determine if this is a recurring event and get pattern details
+                                $isRecurring = "No"
+                                $recurrencePattern = ""
+                                $eventType = if ($event.Type) { $event.Type } else { "singleInstance" }
+                                
+                                # Check if this is a master event (exists in original events list with Type = seriesMaster)
+                                $isMasterEvent = ($events | Where-Object { $_.Id -eq $event.Id -and $_.Type -eq "seriesMaster" }) -ne $null
+                                
+                                if ($eventType -eq "seriesMaster" -and $isMasterEvent) {
+                                    # This is definitely a master event
+                                    $isRecurring = "Yes (Master)"
+                                    if ($event.Recurrence -and $event.Recurrence.Pattern) {
+                                        $pattern = $event.Recurrence.Pattern
+                                        
+                                        $recurrencePattern = switch ($pattern.Type) {
+                                            "daily" { 
+                                                if ($pattern.Interval -eq 1) { "Daily" }
+                                                else { "Every $($pattern.Interval) days" }
+                                            }
+                                            "weekly" { 
+                                                $days = $pattern.DaysOfWeek -join ", "
+                                                if ($pattern.Interval -eq 1) { "Weekly on $days" }
+                                                else { "Every $($pattern.Interval) weeks on $days" }
+                                            }
+                                            "monthly" { 
+                                                if ($pattern.Interval -eq 1) { "Monthly" }
+                                                else { "Every $($pattern.Interval) months" }
+                                            }
+                                            "yearly" { 
+                                                if ($pattern.Interval -eq 1) { "Yearly" }
+                                                else { "Every $($pattern.Interval) years" }
+                                            }
+                                            default { $pattern.Type }
+                                        }
+                                        
+                                        # Add range information if available
+                                        if ($event.Recurrence.Range) {
+                                            $range = $event.Recurrence.Range
+                                            switch ($range.Type) {
+                                                "endDate" { $recurrencePattern += " until $($range.EndDate)" }
+                                                "numbered" { $recurrencePattern += " for $($range.NumberOfOccurrences) occurrences" }
+                                                "noEnd" { $recurrencePattern += " (no end date)" }
+                                            }
+                                        }
+                                    } else {
+                                        $recurrencePattern = "Recurring event master definition"
+                                    }
+                                } elseif ($event.SeriesMasterId -and $masterPatterns.ContainsKey($event.SeriesMasterId)) {
+                                    # This is an instance with a known master pattern
+                                    $isRecurring = "Yes (Instance)"
+                                    $masterRecurrence = $masterPatterns[$event.SeriesMasterId]
+                                    $pattern = $masterRecurrence.Pattern
+                                    
+                                    $recurrencePattern = switch ($pattern.Type) {
+                                        "daily" { 
+                                            if ($pattern.Interval -eq 1) { "Daily" }
+                                            else { "Every $($pattern.Interval) days" }
+                                        }
+                                        "weekly" { 
+                                            $days = $pattern.DaysOfWeek -join ", "
+                                            if ($pattern.Interval -eq 1) { "Weekly on $days" }
+                                            else { "Every $($pattern.Interval) weeks on $days" }
+                                        }
+                                        "monthly" { 
+                                            if ($pattern.Interval -eq 1) { "Monthly" }
+                                            else { "Every $($pattern.Interval) months" }
+                                        }
+                                        "yearly" { 
+                                            if ($pattern.Interval -eq 1) { "Yearly" }
+                                            else { "Every $($pattern.Interval) years" }
+                                        }
+                                        default { $pattern.Type }
+                                    }
+                                    
+                                    # Add range information if available
+                                    if ($masterRecurrence.Range) {
+                                        $range = $masterRecurrence.Range
+                                        switch ($range.Type) {
+                                            "endDate" { $recurrencePattern += " until $($range.EndDate)" }
+                                            "numbered" { $recurrencePattern += " for $($range.NumberOfOccurrences) occurrences" }
+                                            "noEnd" { $recurrencePattern += " (no end date)" }
+                                        }
+                                    }
+                                } elseif ($event.SeriesMasterId) {
+                                    # This has a SeriesMasterId but we don't have the master pattern
+                                    $isRecurring = "Yes (Instance)"
+                                    $recurrencePattern = "Instance of recurring series"
+                                } elseif ($eventType -eq "occurrence") {
+                                    $isRecurring = "Yes (Occurrence)"
+                                    $recurrencePattern = "Recurring event occurrence"
+                                } elseif ($eventType -eq "exception") {
+                                    $isRecurring = "Yes (Exception)"
+                                    $recurrencePattern = "Modified instance of recurring series"
+                                } elseif ($event.Recurrence -and $event.Recurrence.Pattern -and -not $isMasterEvent) {
+                                    # Has recurrence info but is not a master - likely an instance from calendar view
+                                    $isRecurring = "Yes (Instance)"
+                                    $pattern = $event.Recurrence.Pattern
+                                    
+                                    $recurrencePattern = switch ($pattern.Type) {
+                                        "daily" { 
+                                            if ($pattern.Interval -eq 1) { "Daily" }
+                                            else { "Every $($pattern.Interval) days" }
+                                        }
+                                        "weekly" { 
+                                            $days = $pattern.DaysOfWeek -join ", "
+                                            if ($pattern.Interval -eq 1) { "Weekly on $days" }
+                                            else { "Every $($pattern.Interval) weeks on $days" }
+                                        }
+                                        "monthly" { 
+                                            if ($pattern.Interval -eq 1) { "Monthly" }
+                                            else { "Every $($pattern.Interval) months" }
+                                        }
+                                        "yearly" { 
+                                            if ($pattern.Interval -eq 1) { "Yearly" }
+                                            else { "Every $($pattern.Interval) years" }
+                                        }
+                                        default { $pattern.Type }
+                                    }
+                                }
+                                
+                                $allEvents += [PSCustomObject]@{
+                                    UserID            = $user.Mail
+                                    UserDisplayName   = $user.DisplayName
+                                    Department        = $user.Department
+                                    Subject           = $event.Subject
+                                    StartDate         = $event.Start.DateTime
+                                    EndDate           = $event.End.DateTime
+                                    Location          = $locationName
+                                    Organizer         = $organizerName
+                                    AllAttendees      = ($allAttendeesList -join "; ")
+                                    RequiredAttendees = ($requiredAttendees -join "; ")
+                                    OptionalAttendees = ($optionalAttendees -join "; ")
+                                    HasAttachments    = if ($event.HasAttachments) { "Yes" } else { "No" }
+                                    RecurrencePattern = $recurrencePattern
+                                    EventType         = $eventType
+                                }
+                            }
+                        } else {
+                            Write-Host "  No events found in the specified date range" -ForegroundColor Cyan
+                        }
                     }
-                }
-                catch {
-                    $userStatus.EventsError = $_.Exception.Message
-                    $userStatus.OverallStatus = "Failed - Events Error"
+                    catch {
+                        $userStatus.EventsError = $_.Exception.Message
+                        $userStatus.OverallStatus = "Failed - Events Error"
+                        Write-Warning "  Failed to retrieve events: $($_.Exception.Message)"
+                        $errorLog += $userStatus
+                        continue
+                    }
+                } else {
+                    $userStatus.CalendarError = "No 'Calendar', '予定表', or '日历' found"
+                    $userStatus.AvailableCalendars = ($allCalendars.Name -join "; ")
+                    $userStatus.OverallStatus = "Failed - Calendar Not Found"
+                    Write-Host "  No default calendar found. Available: $($userStatus.AvailableCalendars)" -ForegroundColor Yellow
                     $errorLog += $userStatus
                     continue
                 }
-            } else {
-                $userStatus.CalendarError = "No 'Calendar', '予定表', or '日历' found"
-                $userStatus.OverallStatus = "Failed - Calendar Not Found"
+            }
+            catch {
+                $userStatus.CalendarError = $_.Exception.Message
+                $userStatus.OverallStatus = "Failed - Calendar Access Error"
+                Write-Warning "  Failed to access calendars: $($_.Exception.Message)"
                 $errorLog += $userStatus
                 continue
             }
-        }
-        catch {
-            $userStatus.CalendarError = $_.Exception.Message
-            $userStatus.OverallStatus = "Failed - Calendar Access Error"
+            
+            $userStatus.OverallStatus = "Success"
             $errorLog += $userStatus
-            continue
         }
-        
-        $userStatus.OverallStatus = "Success"
-        $errorLog += $userStatus
+    } else {
+        Write-Host "No users found in the 'Public Equity' department." -ForegroundColor Cyan
+        exit
     }
-    catch {
-        $userStatus.UserError = $_.Exception.Message
-        $userStatus.OverallStatus = "Failed - General Error"
-        $errorLog += $userStatus
-    }
+} catch {
+    Write-Error "Failed to retrieve users. Details: $($_.Exception.Message)"
+    exit
 }
 
 # ============================================
 # Export results
 # ============================================
-$exportPath = "E:\gflores"
+$exportPath = "C:\Temp"
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 
-$eventsFile = Join-Path $exportPath "PublicEquity_CalendarEvents_AllUsers_$timestamp.csv"
+$eventsFile = Join-Path $exportPath "PublicEquity_CalendarEvents_$timestamp.csv"
 $logFile    = Join-Path $exportPath "PublicEquity_UserProcessingLog_$timestamp.csv"
 
 if (!(Test-Path $exportPath)) { New-Item -ItemType Directory -Path $exportPath -Force }
@@ -232,11 +526,102 @@ $allEvents | Export-Csv -Path $eventsFile -NoTypeInformation -Encoding UTF8
 $errorLog  | Export-Csv -Path $logFile   -NoTypeInformation -Encoding UTF8
 
 Write-Host "======================================" -ForegroundColor Green
-Write-Host "All users processed!" -ForegroundColor Green
+Write-Host "Processing complete!" -ForegroundColor Green
 Write-Host "======================================" -ForegroundColor Green
 Write-Host "Events file saved to: $eventsFile" -ForegroundColor Yellow
 Write-Host "Processing log saved to: $logFile" -ForegroundColor Yellow
 Write-Host "Total events exported: $($allEvents.Count)" -ForegroundColor Cyan
-Write-Host "Users processed: $($users.Count)" -ForegroundColor Cyan
+Write-Host "Users processed: $totalUsers" -ForegroundColor Cyan
 Write-Host "Successful users: $(($errorLog | Where-Object {$_.OverallStatus -eq 'Success'}).Count)" -ForegroundColor Green
 Write-Host "Failed users: $(($errorLog | Where-Object {$_.OverallStatus -ne 'Success'}).Count)" -ForegroundColor Red
+
+# ============================================
+# Send Email with Results using Microsoft Graph
+# ============================================
+try {
+    Write-Host "`nSending email with results using Microsoft Graph..." -ForegroundColor Cyan
+    
+    $successfulUsers = ($errorLog | Where-Object {$_.OverallStatus -eq 'Success'}).Count
+    $failedUsers = ($errorLog | Where-Object {$_.OverallStatus -ne 'Success'}).Count
+    
+    # Read and encode files for attachments
+    $eventsContent = [Convert]::ToBase64String([IO.File]::ReadAllBytes($eventsFile))
+    $logContent = [Convert]::ToBase64String([IO.File]::ReadAllBytes($logFile))
+    
+    # Create email message
+    $emailBody = @"
+Public Equity Calendar Events Report
+====================================
+
+Report Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+Date Range: Last 7 days ($($StartDate.ToString('yyyy-MM-dd')) to $($EndDate.ToString('yyyy-MM-dd')))
+
+Search Criteria:
+- Department: Starts with 'Public Equity'
+- Account Status: All accounts processed (enabled, disabled, and deleted accounts tracked)
+- Calendar: Default calendar named 'Calendar', '予定表', or '日历'
+- Calendar Events: Events that overlap with the last 7 days
+- Recurring Events: Individual instances and detailed patterns identified
+
+Summary:
+- Total events exported: $($allEvents.Count)
+- Users processed: $totalUsers
+- Successful users: $successfulUsers
+- Failed users: $failedUsers
+
+Recurrence Pattern Details Included:
+- Daily recurrence (every day, every X days)
+- Weekly recurrence (specific days of week, every X weeks)
+- Monthly recurrence (every month, every X months)
+- Yearly recurrence (annual events)
+- Series instances and exceptions tracked
+- End date or occurrence limits identified
+
+Files Generated:
+- Events file: $(Split-Path $eventsFile -Leaf)
+- Processing log: $(Split-Path $logFile -Leaf)
+
+The CSV files are attached to this email and contain detailed calendar event information 
+including attendees, locations, organizers, and comprehensive recurrence patterns.
+
+Best regards,
+Automated Calendar Report System
+"@
+
+    $message = @{
+        subject = "Public Equity Calendar Events Report - $timestamp"
+        body = @{
+            contentType = "Text"
+            content = $emailBody
+        }
+        toRecipients = @(
+            @{
+                emailAddress = @{
+                    address = "gabriel@hashira.tech"
+                }
+            }
+        )
+        attachments = @(
+            @{
+                "@odata.type" = "#microsoft.graph.fileAttachment"
+                name = (Split-Path $eventsFile -Leaf)
+                contentBytes = $eventsContent
+            },
+            @{
+                "@odata.type" = "#microsoft.graph.fileAttachment"
+                name = (Split-Path $logFile -Leaf)
+                contentBytes = $logContent
+            }
+        )
+    }
+    
+    # Send email using Graph API
+    Send-MgUserMail -UserId "gabriel@hashira.tech" -Message $message
+    Write-Host "✔ Email sent successfully to gabriel@hashira.tech via Microsoft Graph" -ForegroundColor Green
+    
+} catch {
+    Write-Warning "Failed to send email via Microsoft Graph: $($_.Exception.Message)"
+    Write-Host "Results are still available in local files:" -ForegroundColor Yellow
+    Write-Host "  Events: $eventsFile" -ForegroundColor Yellow
+    Write-Host "  Log: $logFile" -ForegroundColor Yellow
+}
