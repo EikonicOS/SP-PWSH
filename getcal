@@ -1,0 +1,242 @@
+Write-Host "Connecting to Microsoft Graph..." -ForegroundColor Cyan
+Connect-MgGraph -TenantId $TenantId -ClientId $ClientId -CertificateThumbprint $Thumb
+Write-Host "Connected." -ForegroundColor Green
+
+# ============================================
+# Check required permissions
+# ============================================
+$requiredPermissions = @(
+    "User.Read.All",
+    "Calendars.Read"
+)
+
+Write-Host "Checking Graph permissions for this app..." -ForegroundColor Cyan
+
+try {
+    $sp = Get-MgServicePrincipal -Filter "appId eq '$ClientId'" -ErrorAction Stop
+    
+    $assignedPerms = @()
+    if ($sp.AppRoles) {
+        $sp.AppRoles | ForEach-Object {
+            if ($_.Value) { $assignedPerms += $_.Value }
+        }
+    }
+
+    $missingPerms = $requiredPermissions | Where-Object { $_ -notin $assignedPerms }
+
+    if ($missingPerms.Count -gt 0) {
+        Write-Host "======================================" -ForegroundColor Red
+        Write-Host "ERROR: Missing required permissions!" -ForegroundColor Red
+        Write-Host "This app does not have the following permissions:" -ForegroundColor Yellow
+        $missingPerms | ForEach-Object { Write-Host "  - $_" -ForegroundColor Yellow }
+        Write-Host ""
+        Write-Host "You must add these in Entra ID (Azure AD) > App Registrations > API Permissions," -ForegroundColor Gray
+        Write-Host "then grant admin consent, before this script will work." -ForegroundColor Gray
+        Write-Host "======================================" -ForegroundColor Red
+        throw "Missing permissions: $($missingPerms -join ', ')"
+    }
+    else {
+        Write-Host "All required permissions are present." -ForegroundColor Green
+    }
+}
+catch {
+    Write-Host "FATAL: Could not check permissions. $_" -ForegroundColor Red
+    #exit
+}
+
+# ============================================
+# Path to CSV file containing user IDs
+# ============================================
+$userCsvPath = "E:\gflores\CreditUserIDs.csv"
+
+if (!(Test-Path $userCsvPath)) {
+    Write-Error "User CSV file not found at: $userCsvPath"
+    Write-Host "Please create a CSV file with a 'UserID' column containing email addresses."
+    exit
+}
+
+$users = Import-Csv -Path $userCsvPath
+
+# ============================================
+# Date range (ISO 8601 UTC format)
+# ============================================
+$StartDate = (Get-Date).Date.AddDays(-7)
+$EndDate   = (Get-Date).Date.AddDays(1).AddSeconds(-1)
+
+$StartDateString = $StartDate.ToString("yyyy-MM-ddTHH:mm:ssZ")
+$EndDateString   = $EndDate.ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+# ============================================
+# Initialize
+# ============================================
+$allEvents = @()
+$errorLog = @()
+
+$userCount = 0
+$totalUsers = $users.Count
+
+foreach ($user in $users) {
+    $userCount++
+    $userId = $user.UserID
+    Write-Host "[$userCount/$totalUsers] Processing user: $userId" -ForegroundColor Yellow
+    
+    Start-Sleep -Seconds 1
+    
+    $userStatus = [PSCustomObject]@{
+        UserID            = $userId
+        UserFound         = $false
+        UserDisplayName   = ""
+        UserError         = ""
+        AccountStatus     = ""
+        AccountType       = ""
+        CalendarFound     = $false
+        CalendarID        = ""
+        AvailableCalendars= ""
+        CalendarError     = ""
+        EventsFound       = 0
+        EventsError       = ""
+        OverallStatus     = "Processing"
+        ProcessedDateTime = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+    }
+    
+    try {
+        # --- Get user info ---
+        try {
+            $userCheck = Get-MgUser -UserId $userId -Property Id,DisplayName,UserPrincipalName,AccountEnabled,OnPremisesSyncEnabled,DeletedDateTime,UserType,CreationType -ErrorAction Stop
+            Write-Host "  User found: $($userCheck.DisplayName)" -ForegroundColor Green
+            $userStatus.UserFound = $true
+            $userStatus.UserDisplayName = $userCheck.DisplayName
+            
+            if ($userCheck.DeletedDateTime) {
+                $userStatus.AccountStatus = "Soft-Deleted"
+            } elseif (-not $userCheck.AccountEnabled) {
+                $userStatus.AccountStatus = "Disabled/Inactive"
+            } elseif ($userCheck.OnPremisesSyncEnabled -eq $true) {
+                $userStatus.AccountStatus = "Active"
+                $userStatus.AccountType = "On-Premises Synced"
+            } else {
+                $userStatus.AccountStatus = "Active"
+                $userStatus.AccountType = "Cloud-Only"
+            }
+            
+            if ($userCheck.UserType) {
+                $userStatus.AccountType += " ($($userCheck.UserType))"
+            }
+        }
+        catch {
+            Write-Host "  ERROR: User not found or inaccessible: $($_.Exception.Message)" -ForegroundColor Red
+            $userStatus.UserError = $_.Exception.Message
+            $userStatus.OverallStatus = "Failed - User Lookup Error"
+            $errorLog += $userStatus
+            continue
+        }
+        
+        # --- Get calendars ---
+        try {
+            $allCalendars = Get-MgUserCalendar -UserId $userId -ErrorAction Stop
+            
+            $calendar = $allCalendars | Where-Object { $_.Name -in @("Calendar", "予定表", "日历") } | Select-Object -First 1
+            
+            if ($calendar) {
+                $userStatus.CalendarFound = $true
+                $userStatus.CalendarID = $calendar.Id
+                Write-Host "  Calendar found: $($calendar.Name)" -ForegroundColor Green
+                
+                try {
+                    $events = Get-MgUserCalendarEvent -UserId $userId -CalendarId $calendar.Id `
+                        -Filter "start/dateTime ge '$StartDateString' and end/dateTime le '$EndDateString'" `
+                        -Property subject,locations,attendees,start,end,organizer,hasAttachments,attachments `
+                        -Top 999 -ErrorAction Stop
+                    
+                    if ($events) {
+                        $userStatus.EventsFound = $events.Count
+                        foreach ($event in $events) {
+                            $locationName = if ($event.Locations -and $event.Locations.Count -gt 0) { $event.Locations[0].DisplayName } else { "" }
+                            
+                            $requiredAttendees = @()
+                            $optionalAttendees = @()
+                            $allAttendeesList = @()
+                            
+                            if ($event.Attendees) {
+                                foreach ($attendee in $event.Attendees) {
+                                    $attendeeName = $attendee.EmailAddress.Name
+                                    $allAttendeesList += $attendeeName
+                                    
+                                    switch ($attendee.Type) {
+                                        "required" { $requiredAttendees += $attendeeName }
+                                        "optional" { $optionalAttendees += $attendeeName }
+                                        default { $requiredAttendees += $attendeeName }
+                                    }
+                                }
+                            }
+                            
+                            $organizerName = if ($event.Organizer) { $event.Organizer.EmailAddress.Name } else { "" }
+                            
+                            $allEvents += [PSCustomObject]@{
+                                UserID            = $userId
+                                Subject           = $event.Subject
+                                StartDate         = $event.Start.DateTime
+                                EndDate           = $event.End.DateTime
+                                Location          = $locationName
+                                Organizer         = $organizerName
+                                AllAttendees      = ($allAttendeesList -join "; ")
+                                RequiredAttendees = ($requiredAttendees -join "; ")
+                                OptionalAttendees = ($optionalAttendees -join "; ")
+                                HasAttachments    = if ($event.HasAttachments) { "Yes" } else { "No" }
+                            }
+                        }
+                    }
+                }
+                catch {
+                    $userStatus.EventsError = $_.Exception.Message
+                    $userStatus.OverallStatus = "Failed - Events Error"
+                    $errorLog += $userStatus
+                    continue
+                }
+            } else {
+                $userStatus.CalendarError = "No 'Calendar', '予定表', or '日历' found"
+                $userStatus.OverallStatus = "Failed - Calendar Not Found"
+                $errorLog += $userStatus
+                continue
+            }
+        }
+        catch {
+            $userStatus.CalendarError = $_.Exception.Message
+            $userStatus.OverallStatus = "Failed - Calendar Access Error"
+            $errorLog += $userStatus
+            continue
+        }
+        
+        $userStatus.OverallStatus = "Success"
+        $errorLog += $userStatus
+    }
+    catch {
+        $userStatus.UserError = $_.Exception.Message
+        $userStatus.OverallStatus = "Failed - General Error"
+        $errorLog += $userStatus
+    }
+}
+
+# ============================================
+# Export results
+# ============================================
+$exportPath = "E:\gflores"
+$timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+
+$eventsFile = Join-Path $exportPath "PublicEquity_CalendarEvents_AllUsers_$timestamp.csv"
+$logFile    = Join-Path $exportPath "PublicEquity_UserProcessingLog_$timestamp.csv"
+
+if (!(Test-Path $exportPath)) { New-Item -ItemType Directory -Path $exportPath -Force }
+
+$allEvents | Export-Csv -Path $eventsFile -NoTypeInformation -Encoding UTF8
+$errorLog  | Export-Csv -Path $logFile   -NoTypeInformation -Encoding UTF8
+
+Write-Host "======================================" -ForegroundColor Green
+Write-Host "All users processed!" -ForegroundColor Green
+Write-Host "======================================" -ForegroundColor Green
+Write-Host "Events file saved to: $eventsFile" -ForegroundColor Yellow
+Write-Host "Processing log saved to: $logFile" -ForegroundColor Yellow
+Write-Host "Total events exported: $($allEvents.Count)" -ForegroundColor Cyan
+Write-Host "Users processed: $($users.Count)" -ForegroundColor Cyan
+Write-Host "Successful users: $(($errorLog | Where-Object {$_.OverallStatus -eq 'Success'}).Count)" -ForegroundColor Green
+Write-Host "Failed users: $(($errorLog | Where-Object {$_.OverallStatus -ne 'Success'}).Count)" -ForegroundColor Red
